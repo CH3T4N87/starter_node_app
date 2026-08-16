@@ -17,3 +17,7 @@ export const validateId = z.object({
     id: z.coerce.number().int().positive()
 })
 
+export const signupSchema = z.object({
+  email: z.email("Invalid email"),
+  password: z.string().min(8, "Password must be at least 8 characters"),
+});
