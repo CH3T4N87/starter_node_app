@@ -1,7 +1,7 @@
 import express, { type Request, type Response, type NextFunction } from "express";
 import { pool } from "./db.js";
 import { createTodoSchema, signupSchema, updateTodoSchema, validateId } from "./schema.js";
-import { validateIdParam } from "./middleware/middleware.js";
+import { authMiddleware, validateIdParam } from "./middleware/middleware.js";
 import { errorHandler } from "./errorHandler.js";
 import bcrypt from "bcrypt";
 import dotenv from "dotenv";
@@ -28,9 +28,10 @@ app.get("/health", async (req: Request, res: Response, next: NextFunction) => {
     }
 });
 
-app.get("/todos", async (req: Request, res: Response, next: NextFunction) => {
+app.get("/todos", authMiddleware, async (req: Request, res: Response, next: NextFunction) => {
     try {
-        const result = await pool.query('SELECT * from todos');
+        const userId = req.userId;
+        const result = await pool.query('SELECT * from todos WHERE user_id = $1', [userId]);
         res.status(200).json({
             "todos": result.rows
         })
@@ -39,7 +40,34 @@ app.get("/todos", async (req: Request, res: Response, next: NextFunction) => {
     }
 })
 
-app.post("/todos", async (req: Request, res: Response, next: NextFunction) => {
+app.get("/todos/:id", authMiddleware, validateIdParam, async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const { id } = req.params;
+
+        const todo = (await pool.query("SELECT * FROM todos WHERE id = $1", [id])).rows[0];
+
+        if(!todo){
+            return res.status(404).json({
+                message: "Todo not found"
+            })
+        }
+
+        if(!(todo.user_id === req.userId)){
+            return res.status(403).json({
+                message: "You don't have enought permissions to view this todo."
+            })
+        }
+
+        res.status(200).json({
+            todo
+        })
+
+    } catch (e: any) {
+        next(e);
+    }
+})
+
+app.post("/todos", authMiddleware, async (req: Request, res: Response, next: NextFunction) => {
     try {
 
         const parsedResult = createTodoSchema.safeParse(req.body);
@@ -51,17 +79,22 @@ app.post("/todos", async (req: Request, res: Response, next: NextFunction) => {
             })
         }
         const { title, completed = false } = parsedResult.data;
-        const result = await pool.query(`INSERT INTO todos (title, completed) VALUES ($1, $2) RETURNING *`, [title, completed]);
+
+        const userId = req.userId;
+
+        const result = await pool.query(`INSERT INTO todos (title, completed, user_id) VALUES ($1, $2, $3) RETURNING *`, [title, completed, userId]);
+
         res.status(201).json({
             "status": "todo created successfully.",
-            "todo": result.rows[0]
-        })
+            "todo": result.rows[0],
+        });
+
     } catch (e: any) {
         next(e);
     }
 })
 
-app.patch("/todos/:id", validateIdParam, async (req: Request, res: Response, next: NextFunction) => {
+app.patch("/todos/:id", authMiddleware, validateIdParam, async (req: Request, res: Response, next: NextFunction) => {
     try {
         const { id } = req.params;
 
@@ -72,6 +105,16 @@ app.patch("/todos/:id", validateIdParam, async (req: Request, res: Response, nex
                 message: "Validation failed",
                 errors: parsedResult.error.flatten().fieldErrors,
             });
+        }
+
+        const todo = (await pool.query("SELECT * FROM todos WHERE id = $1", [id])).rows[0];
+
+        if (!todo) {
+            return res.status(404).json({ message: "Todo not found" });
+        }
+
+        if (todo.user_id !== req.userId) {
+            return res.status(403).json({ message: "You don't have permission to update this todo" });
         }
 
         const { title, completed } = parsedResult.data;
@@ -96,9 +139,6 @@ app.patch("/todos/:id", validateIdParam, async (req: Request, res: Response, nex
 
         const result = await pool.query(`UPDATE TODOS SET ${fields.join(", ")} WHERE id = $${paramIndex} RETURNING *`, values);
 
-        if (result.rows.length === 0) return res.status(404).json({
-            "message": "No such record found"
-        })
 
         res.json({
             "status": "todo updated successfully.",
@@ -109,9 +149,23 @@ app.patch("/todos/:id", validateIdParam, async (req: Request, res: Response, nex
     }
 });
 
-app.delete("/todos/:id", validateIdParam, async (req: Request, res: Response, next: NextFunction) => {
+app.delete("/todos/:id", authMiddleware, validateIdParam, async (req: Request, res: Response, next: NextFunction) => {
     try {
         const { id } = req.params;
+
+        const todo = (await pool.query("SELECT * from todos WHERE id = $1", [id])).rows[0];
+
+        if (!todo) {
+            return res.status(404).json({
+                message: "Todo not found"
+            })
+        }
+
+        if (!(req.userId === todo.user_id)) {
+            return res.status(403).json({
+                message: "You don't have enough permissions."
+            })
+        }
         const result = await pool.query('DELETE FROM todos WHERE id = $1 RETURNING *', [id]);
 
         if (result.rows.length === 0) {
@@ -191,8 +245,19 @@ app.post("/login", async (req, res, next) => {
             }
         );
 
+        const refreshToken = jwt.sign(
+            { userId: user.id },
+            process.env.JWT_REFRESH_SECRET as jwt.Secret,
+            {
+                expiresIn: "7d"
+            }
+        )
+
+        await pool.query("INSERT INTO refresh_tokens (user_id, token, expires_at) VALUES ($1, $2, $3)", [req.userId, refreshToken, Date.now()])
+
         res.status(200).json({
-            accessToken
+            accessToken,
+            refreshToken
         })
     } catch (e: any) {
         next(e);
